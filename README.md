@@ -10,7 +10,7 @@ The command gets squelch's stdin. If stdout is piped or redirected, squelch draw
 
 # Demo
 
-[![squelch demo](https://asciinema.org/a/ZpQG6MNcTSz8sgro.svg)](https://asciinema.org/a/ZpQG6MNcTSz8sgro)
+[![squelch demo](demo/demo.svg)](https://asciinema.org/a/ZpQG6MNcTSz8sgro)
 
 The demo runs `demo/skyctl`, a pretend deploy tool, first on its own and then through squelch. `demo/demo.sh` drives the recording.
 

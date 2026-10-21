@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# skyctl is a pretend deploy tool for the squelch demo. Like many real CLIs, it's noisy on stderr and prints its result
+# on stdout. --region=mars-1 makes it fail.
+set -u
+
+svc=${2:-api}
+region=us-east-1
+for arg; do
+  case $arg in
+  --region=*) region=${arg#--region=} ;;
+  esac
+done
+
+log() {
+  printf '%s\n' "$*" >&2
+  sleep 0.12
+}
+
+log "Loading configuration from ./sky.yaml"
+log "WARNING: config key 'runtime' is deprecated, see https://docs.example.com/sky/migrate-v2"
+log "Authenticating..."
+log "Open https://auth.example.com/device?code=WXYZ-4821 to approve this device"
+sleep 0.8
+log "Authenticated as dev@example.com"
+log "Resolving region $region"
+if [[ $region == mars-1 ]]; then
+  log "ERROR: region mars-1 is not available for project acme-prod"
+  log "Available regions: us-east-1, us-west-2, eu-west-1"
+  log "See https://status.example.com/regions for details"
+  exit 3
+fi
+for i in $(seq 1 12); do
+  log "Uploading layer $i/12 sha256:$(printf '%08x' $((i * 2654435761 % 4294967296)))"
+done
+log ""
+log "Waiting for rollout, track it at https://console.example.com/deploys/7731"
+for p in 10 35 60 85 100; do
+  log "  rollout: $p% healthy"
+  sleep 0.2
+done
+echo "deployed $svc v1.4.2 to $region"
+echo "url: https://$svc.example.com"

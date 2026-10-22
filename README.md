@@ -46,6 +46,12 @@ This wraps `gcloud` in a function that runs `squelch run gcloud`, and tab comple
 
 ```sh
 NOSQUELCH=1 gcloud compute instances list
+```
+
+Some commands can't run under squelch at all, such as a full-screen terminal UI, which needs the terminal as its stdout. To skip squelch whenever a wrapped command gets a particular argument, add `--skip-arg`. It's repeatable, applies to every `--cmd`, and matches whole arguments only, so `--tui=true` doesn't count:
+
+```sh
+eval "$(squelch init zsh --cmd ct --skip-arg --tui)"
 ``` `init` includes squelch's own completion, so don't also load `squelch completion zsh`, which would take back completion for `squelch` and turn off the passthrough.
 
 Only zsh is supported for now.

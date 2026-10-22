@@ -11,12 +11,13 @@ _squelch_run() {
   fi
 }
 compdef _squelch_run squelch
-# Wrap each command in a function, which can check NOSQUELCH when it runs. An alias of the same name would win over the
-# function, so drop it. The function keyword keeps the name from being alias-expanded before the unalias runs.
-{{- range .}}
+# Wrap each command in a function, which can check NOSQUELCH and its arguments when it runs. An alias of the same name
+# would win over the function, so drop it. The function keyword keeps the name from being alias-expanded before the
+# unalias runs.
+{{- range .Cmds}}
 (( ${+aliases[{{.}}]} )) && unalias {{.}}
 function {{.}} {
-  if [[ -n ${NOSQUELCH-} ]]; then
+  if [[ -n ${NOSQUELCH-} ]]{{range $.SkipArgs}} || (( ${argv[(Ie){{.}}]} )){{end}}; then
     command {{.}} "$@"
   else
     squelch run {{.}} "$@"

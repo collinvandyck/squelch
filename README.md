@@ -42,6 +42,10 @@ To use squelch every time you run a command, add this to your `.zshrc` after `co
 eval "$(squelch init zsh --cmd gcloud)"
 ```
 
-This aliases `gcloud` to `squelch run gcloud` and sets up completion so that tab completion for `gcloud` still works. Repeat `--cmd` to wrap more commands. `init` includes squelch's own completion, so don't also load `squelch completion zsh`, which would take back completion for `squelch` and turn off the passthrough.
+This wraps `gcloud` in a function that runs `squelch run gcloud`, and tab completion for `gcloud` still works. Repeat `--cmd` to wrap more commands. To skip squelch for one run, set `NOSQUELCH` to anything non-empty:
+
+```sh
+NOSQUELCH=1 gcloud compute instances list
+``` `init` includes squelch's own completion, so don't also load `squelch completion zsh`, which would take back completion for `squelch` and turn off the passthrough.
 
 Only zsh is supported for now.

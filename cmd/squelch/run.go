@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -29,7 +30,6 @@ func newRunCmd() *cobra.Command {
 }
 
 func run(args []string) error {
-	m := newModel(args)
 	opts := []tea.ProgramOption{
 		// The command gets our stdin, so Bubbletea must not read it. Without input, Bubbletea also skips its terminal
 		// queries, whose replies would otherwise leak into the shell after we exit (bubbletea#1590).
@@ -37,29 +37,33 @@ func run(args []string) error {
 		// Without raw mode, Ctrl+C is a real SIGINT, and Bubbletea would quit on it before the command exits.
 		tea.WithoutSignalHandler(),
 	}
+	var directStdout io.Writer
 	switch {
 	case term.IsTerminal(os.Stdout.Fd()):
 	case term.IsTerminal(os.Stderr.Fd()):
 		// Drawing on stdout would put frames and terminal queries in the command's output, so draw on stderr and give
 		// the command our stdout directly.
 		opts = append(opts, tea.WithOutput(os.Stderr))
-		m.directStdout = os.Stdout
+		directStdout = os.Stdout
 	default:
 		return runPlain(args)
 	}
-	p := tea.NewProgram(m, opts...)
-	// The model owns the command, so it does the forwarding.
-	stop := catchSignals(func(sig os.Signal) { p.Send(signalMsg{sig}) })
-	defer stop()
-	ret, err := p.Run()
-	m, _ = ret.(model)
-	if m.command.cmd != nil {
-		m.command.cancel()
-	}
+	c, err := startCommand(args, directStdout)
 	if err != nil {
 		return err
 	}
-	return finish(m.err, m.stderr)
+	defer c.cancel()
+	// Forward signals here rather than through Bubbletea, whose event loop blocks while a prompt waits for an answer.
+	stop := catchSignals(func(sig os.Signal) { _ = c.cmd.Process.Signal(sig) })
+	defer stop()
+	m := newModel(c)
+	m.stdinIsTerminal = term.IsTerminal(os.Stdin.Fd())
+	ret, err := tea.NewProgram(m, opts...).Run()
+	if err != nil {
+		return err
+	}
+	m = ret.(model)
+	return finish(m.err, m.stderr[m.stderrShown:])
 }
 
 // runPlain passes stdin and stdout straight through and holds stderr back until we know whether the command failed.

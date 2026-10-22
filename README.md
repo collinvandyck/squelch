@@ -6,6 +6,8 @@ While the command runs, squelch shows the last four non-blank lines of stderr, d
 
 When the command exits, the live view disappears. If the command succeeded, its stderr is discarded. If it failed, squelch prints the full stderr and exits the same way the command did, with the same exit code or by the same signal.
 
+When stdin is a terminal, squelch watches for prompts: a line that ends like a question (`?`, `:`, `]`, `)` or `>`) with no newline after it, followed by a pause. squelch clears the live view and shows the prompt as-is. A prompt on stderr also brings along any stderr you haven't seen yet, since the question is probably about it. Once you answer and the command writes again, the live view comes back.
+
 The command gets squelch's stdin. If stdout is piped or redirected, squelch draws on stderr instead and the command's output passes through untouched. If neither is a terminal, squelch skips the live view and just holds stderr back until it knows whether the command failed.
 
 # Demo

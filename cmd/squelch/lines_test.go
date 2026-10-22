@@ -18,6 +18,8 @@ func TestLineBufferWrite(t *testing.T) {
 		{name: "several lines in one write", writes: []string{"a\nb\nc\n"}, want: []string{"a", "b", "c"}},
 		{name: "blank lines kept", writes: []string{"\n", "a\n\n"}, want: []string{"", "a", ""}},
 		{name: "trailing partial held back", writes: []string{"a\nb", "c"}, want: []string{"a"}, rest: "bc"},
+		{name: "crlf endings dropped", writes: []string{"a\r\nb\r", "\n"}, want: []string{"a", "b"}},
+		{name: "carriage return keeps what overwrote", writes: []string{"10%\r50%\r100%\n"}, want: []string{"100%"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var b lineBuffer

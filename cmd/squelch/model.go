@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"os"
@@ -17,38 +18,52 @@ const (
 	// tea.Println output written before the renderer's first flush lands at the top of the screen, and the first frame
 	// then erases everything below it (bubbletea#1740). Frames flush every ~16ms, so wait a few before printing.
 	firstPrintDelay = 50 * time.Millisecond
+	// promptIdle is how long the command must go quiet partway through a line before we take the line for a prompt.
+	promptIdle      = 150 * time.Millisecond
 	stderrTailLines = 4
 )
 
 type (
 	model struct {
-		args    []string
 		command command
 		err     error
-		// directStdout, when set, receives the command's stdout instead of it being printed through Bubbletea.
-		directStdout io.Writer
-		stdout       lineBuffer
-		stderr       []byte // everything the command wrote, untouched, for the dump on failure
-		stderrLines  lineBuffer
-		stderrTail   []string
-		links        linkList
-		width        int
-		exiting      bool
+		// stdinIsTerminal means someone can answer a prompt, so we look for them.
+		stdinIsTerminal bool
+		stdout          lineBuffer
+		stderr          []byte // everything the command wrote, untouched, for the dump on failure
+		stderrShown     int    // how much of stderr a prompt has already shown
+		stderrLines     lineBuffer
+		stderrTail      []string
+		links           linkList
+		lastOutput      time.Time
+		width           int
+		prompting       bool
+		exiting         bool
 	}
 	command struct {
 		cmd    *exec.Cmd
 		errs   chan error
 		stdout chan []byte
 		stderr chan []byte
-		cancel context.CancelFunc
+		// activity gets a signal after each read from the command, and exited closes once it has exited.
+		activity chan struct{}
+		exited   chan struct{}
+		cancel   context.CancelFunc
 	}
-	tickMsg   time.Time
-	signalMsg struct{ sig os.Signal }
+	// prompt is a tea.ExecCommand that shows a command's prompt while Bubbletea is paused, then waits for the command
+	// to write again or exit, which means the prompt has been answered.
+	prompt struct {
+		text    []byte
+		command command
+		out     io.Writer
+	}
+	tickMsg       time.Time
+	promptDoneMsg struct{}
 )
 
-func newModel(args []string) model {
+func newModel(c command) model {
 	return model{
-		args: args,
+		command: c,
 	}
 }
 
@@ -94,19 +109,44 @@ func (c command) tryRead(ch <-chan []byte) (res []byte) {
 	}
 }
 
+// waitForOutput blocks until the command writes something we haven't read yet, or exits.
+func (c command) waitForOutput() {
+	// activity may hold a signal for output we've already read, so clear it before checking for unread output.
+	select {
+	case <-c.activity:
+	default:
+	}
+	if len(c.stdout) > 0 || len(c.stderr) > 0 {
+		return
+	}
+	select {
+	case <-c.activity:
+	case <-c.exited:
+	}
+}
+
+func (p *prompt) Run() error {
+	if _, err := p.out.Write(p.text); err != nil {
+		return err
+	}
+	p.command.waitForOutput()
+	return nil
+}
+
+func (p *prompt) SetStdin(io.Reader) {}
+
+func (p *prompt) SetStdout(w io.Writer) {
+	p.out = w
+}
+
+func (p *prompt) SetStderr(io.Writer) {}
+
 func (m model) Init() tea.Cmd {
-	return m.startCmd
+	return m.tickAfter(firstPrintDelay)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case command:
-		m.command = msg
-		return m, m.tickAfter(firstPrintDelay)
-	case signalMsg:
-		if m.command.cmd != nil && m.command.cmd.Process != nil {
-			_ = m.command.cmd.Process.Signal(msg.sig)
-		}
 	case tickMsg:
 		err, done := m.command.tryWait()
 		m.err = err
@@ -116,6 +156,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			stdout, stderr = m.command.drain()
 		} else {
 			stdout, stderr = m.command.tryStdout(), m.command.tryStderr()
+		}
+		if len(stdout) > 0 || len(stderr) > 0 {
+			m.lastOutput = time.Time(msg)
 		}
 		m.stderr = append(m.stderr, stderr...)
 		stderrLines := m.stderrLines.write(stderr)
@@ -139,14 +182,44 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if finished {
 			m.exiting = true
 			cmds = append(cmds, tea.Quit)
+		} else if p, ok := m.takePrompt(time.Time(msg)); ok {
+			// The empty view this renders erases the live view before Bubbletea hands over the terminal.
+			m.prompting = true
+			cmds = append(cmds, tea.Exec(p, func(error) tea.Msg { return promptDoneMsg{} }))
 		} else {
 			cmds = append(cmds, m.tick())
 		}
 		return m, tea.Sequence(cmds...)
+	case promptDoneMsg:
+		m.prompting = false
+		return m, m.tick()
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 	}
 	return m, nil
+}
+
+// takePrompt returns a prompt if the command has gone quiet partway through a line that reads like a question. A
+// prompt on stderr brings the rest of the unshown stderr with it, since the question is likely about that output.
+func (m *model) takePrompt(now time.Time) (*prompt, bool) {
+	if !m.stdinIsTerminal || now.Sub(m.lastOutput) < promptIdle {
+		return nil, false
+	}
+	var text []byte
+	if looksLikePrompt(m.stderrLines.partial) {
+		text = append(text, m.stderr[m.stderrShown:]...)
+		m.stderrShown = len(m.stderr)
+		m.stderrLines.flush()
+		m.stderrTail = nil
+	}
+	if looksLikePrompt(m.stdout.partial) {
+		line, _ := m.stdout.flush()
+		text = append(text, line...)
+	}
+	if len(text) == 0 {
+		return nil, false
+	}
+	return &prompt{text: text, command: m.command}, true
 }
 
 // addStderrTail skips blank lines, which would only use up the tail's few lines. m.stderr still has them.
@@ -171,10 +244,11 @@ func (m model) tickAfter(d time.Duration) tea.Cmd {
 	})
 }
 
-// View shows the links found in stderr so far, then the last few lines of stderr, dimmed. Once we're exiting it renders
-// nothing, so the final frame erases it all; otherwise Bubbletea leaves all but the last line on screen.
+// View shows the links found in stderr so far, then the last few lines of stderr, dimmed. While a prompt has the
+// terminal, or once we're exiting, it renders nothing, so the final frame erases it all; otherwise Bubbletea leaves all
+// but the last line on screen.
 func (m model) View() tea.View {
-	if m.exiting {
+	if m.exiting || m.prompting {
 		return tea.NewView("")
 	}
 	var sections []string
@@ -201,16 +275,19 @@ func (m model) stderrTailView() string {
 	return strings.Join(lines, "\n")
 }
 
-func (m model) startCmd() tea.Msg {
+// startCommand starts the command with our stdin, reading its output into channels. Its stdout goes to directStdout
+// instead when that's set.
+func startCommand(args []string, directStdout io.Writer) (command, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, m.args[0], m.args[1:]...)
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	stdout := make(chan []byte, 1024)
 	stderr := make(chan []byte, 1024)
+	activity := make(chan struct{}, 1)
 	// Closing a pipe ends its reader, which then closes the channel.
 	var pipes []*io.PipeWriter
 	pipeTo := func(ch chan<- []byte) io.Writer {
 		r, w := io.Pipe()
-		go readBytesToChan(r, ch)
+		go readBytesToChan(r, ch, activity)
 		pipes = append(pipes, w)
 		return w
 	}
@@ -219,48 +296,67 @@ func (m model) startCmd() tea.Msg {
 			_ = w.Close()
 		}
 	}
-	if m.directStdout != nil {
-		cmd.Stdout = m.directStdout
+	if directStdout != nil {
+		cmd.Stdout = directStdout
 		close(stdout)
 	} else {
 		cmd.Stdout = pipeTo(stdout)
 	}
 	cmd.Stderr = pipeTo(stderr)
 	cmd.Stdin = os.Stdin
-	errs := make(chan error, 1)
-	start := command{
-		cancel: cancel,
-		cmd:    cmd,
-		errs:   errs,
-		stdout: stdout,
-		stderr: stderr,
-	}
 	if err := cmd.Start(); err != nil {
-		errs <- err
-		close(errs)
 		closePipes()
-		return start
+		cancel()
+		return command{}, err
 	}
+	errs := make(chan error, 1)
+	exited := make(chan struct{})
 	go func() {
+		defer close(exited)
 		defer close(errs)
 		if err := cmd.Wait(); err != nil {
 			errs <- err
 		}
 		closePipes()
 	}()
-	return start
+	return command{
+		cancel:   cancel,
+		cmd:      cmd,
+		errs:     errs,
+		stdout:   stdout,
+		stderr:   stderr,
+		activity: activity,
+		exited:   exited,
+	}, nil
 }
 
-func readBytesToChan(in *io.PipeReader, out chan<- []byte) {
+func readBytesToChan(in *io.PipeReader, out chan<- []byte, activity chan<- struct{}) {
 	defer close(out)
 	for {
 		rb := make([]byte, 1024)
 		n, err := in.Read(rb)
 		if n > 0 {
 			out <- rb[:n]
+			select {
+			case activity <- struct{}{}:
+			default:
+			}
 		}
 		if err != nil {
 			return
 		}
 	}
+}
+
+// looksLikePrompt reports whether an unterminated line reads like a question waiting for an answer, such as
+// "Continue? [y/n] " or "Password: ". A carriage return means a progress line redrawing itself, not a prompt.
+func looksLikePrompt(partial []byte) bool {
+	if bytes.IndexByte(partial, '\r') >= 0 {
+		return false
+	}
+	s := strings.TrimRight(ansi.Strip(string(partial)), " \t")
+	if s == "" {
+		return false
+	}
+	return strings.ContainsRune("?:]>)", rune(s[len(s)-1]))
 }

@@ -46,15 +46,78 @@ func TestRunShowsStdoutPrompt(t *testing.T) {
 	term.wait(t)
 }
 
-// TestRunShowsStderrPromptWithContext checks that a prompt on stderr shows up along with the stderr before it, including
-// lines that had scrolled out of the live tail.
-func TestRunShowsStderrPromptWithContext(t *testing.T) {
-	term := startInPty(t, `for i in 1 2 3 4 5 6; do echo "plan $i" >&2; done; printf 'Proceed? ' >&2; read x; echo "answer: $x"`)
+// TestRunShowsStderrPrompt checks that a prompt on stderr without a trailing newline shows up in the live tail while
+// the command waits for an answer.
+func TestRunShowsStderrPrompt(t *testing.T) {
+	term := startInPty(t, `echo "plan 1" >&2; printf 'Proceed? ' >&2; read x; echo "answer: $x"`)
 	term.waitFor(t, "Proceed?")
-	term.waitFor(t, "plan 1")
 	term.write(t, "y\n")
 	term.waitFor(t, "answer: y")
 	term.wait(t)
+}
+
+// TestRunGivesStdoutATerminal checks that the command's stdout is a terminal, as it would be without squelch, so that
+// colors, prompts, and full-screen programs work.
+func TestRunGivesStdoutATerminal(t *testing.T) {
+	term := startInPty(t, `if [ -t 1 ]; then echo "stdout is a terminal"; else echo "stdout is not a terminal"; fi`)
+	term.wait(t)
+	term.waitFor(t, "stdout is a terminal")
+}
+
+// TestRunKeepsViewOffUnfinishedLine checks that the live view doesn't draw over a line of stdout the command hasn't
+// finished, such as a prompt waiting for an answer.
+func TestRunKeepsViewOffUnfinishedLine(t *testing.T) {
+	term := startInPty(t, `printf 'Name: '; echo noise >&2; read x; echo "hi $x"`)
+	term.waitFor(t, "Name: ")
+	time.Sleep(300 * time.Millisecond)
+	if strings.Contains(term.text(), "noise") {
+		t.Fatalf("view drawn over the prompt:\n%q", term.text())
+	}
+	term.write(t, "bob\n")
+	term.waitFor(t, "hi bob")
+	term.wait(t)
+}
+
+// TestRunKeepsViewOffAltScreen checks that the live view isn't drawn while the command is on the alternate screen.
+func TestRunKeepsViewOffAltScreen(t *testing.T) {
+	term := startInPty(t, `printf '\033[?1049h'; echo noise >&2; sleep 0.3; printf '\033[?1049l'`)
+	term.wait(t)
+	out := term.raw()
+	leave := strings.Index(out, "\x1b[?1049l")
+	if leave < 0 {
+		t.Fatalf("command's output didn't reach the terminal:\n%q", out)
+	}
+	if noise := strings.Index(out, "noise"); noise >= 0 && noise < leave {
+		t.Errorf("view drawn on the alternate screen:\n%q", out)
+	}
+}
+
+// TestRunDumpsStderrOnFailure checks that a failing command's stderr is printed in full and its exit code is passed on.
+func TestRunDumpsStderrOnFailure(t *testing.T) {
+	term := startInPty(t, `for i in 1 2 3 4 5 6; do echo "oops $i" >&2; done; exit 3`)
+	err := term.cmd.Wait()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 3 {
+		t.Fatalf("squelch exited with %v, want exit code 3", err)
+	}
+	term.waitFor(t, "oops 1")
+}
+
+// TestRunDoesNotWaitForBackgroundProcesses checks that squelch exits with the command, even when something the command
+// started in the background still holds its stdout and stderr open.
+func TestRunDoesNotWaitForBackgroundProcesses(t *testing.T) {
+	term := startInPty(t, `sleep 10 & echo started`)
+	done := make(chan error, 1)
+	go func() { done <- term.cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("squelch failed: %v\noutput:\n%q", err, term.text())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("squelch still running 5s after the command exited")
+	}
+	term.waitFor(t, "started")
 }
 
 // TestRunCtrlCAtPrompt checks that Ctrl+C while a prompt waits ends the command, and squelch dies from SIGINT with it.
@@ -134,9 +197,13 @@ func startInPty(t *testing.T, script string) *ptyTerm {
 }
 
 func (p *ptyTerm) text() string {
+	return ansi.Strip(p.raw())
+}
+
+func (p *ptyTerm) raw() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return ansi.Strip(p.out.String())
+	return p.out.String()
 }
 
 func (p *ptyTerm) waitFor(t *testing.T, want string) {

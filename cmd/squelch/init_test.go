@@ -1,11 +1,9 @@
 package main
 
 import (
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -31,40 +29,6 @@ eval "$(squelch init zsh --cmd fakecmd)"
 				t.Errorf("output = %q, want %q", got, tc.want)
 			}
 		})
-	}
-}
-
-// TestInitZshSkipArg checks that a wrapped command skips squelch when one of its arguments exactly matches a --skip-arg.
-func TestInitZshSkipArg(t *testing.T) {
-	dir := setUpZsh(t)
-	for _, tc := range []struct {
-		name string
-		args string
-		want string
-	}{
-		{name: "no skip arg", args: "sleuth url", want: "out\n"},
-		{name: "first skip arg", args: "sleuth --tui url", want: "out\nerr\n"},
-		{name: "second skip arg", args: "--interactive", want: "out\nerr\n"},
-		{name: "partial match", args: "--tui=false", want: "out\n"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got := runZsh(t, dir, `
-eval "$(squelch init zsh --cmd fakecmd --skip-arg --tui --skip-arg --interactive)"
-fakecmd `+tc.args)
-			if got != tc.want {
-				t.Errorf("output = %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
-// TestInitRejectsUnsafeSkipArg checks that a --skip-arg that would need shell quoting is refused.
-func TestInitRejectsUnsafeSkipArg(t *testing.T) {
-	cmd := newRootCmd()
-	cmd.SetArgs([]string{"init", "zsh", "--cmd", "ct", "--skip-arg", "--tui]}; rm -rf ~"})
-	cmd.SetOut(io.Discard)
-	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "invalid skip argument") {
-		t.Errorf("err = %v, want an invalid skip argument error", err)
 	}
 }
 

@@ -6,9 +6,9 @@ While the command runs, squelch shows the last four non-blank lines of stderr, d
 
 When the command exits, the live view disappears. If the command succeeded, its stderr is discarded. If it failed, squelch prints the full stderr and exits the same way the command did, with the same exit code or by the same signal.
 
-When stdin is a terminal, squelch watches for prompts: a line that ends like a question (`?`, `:`, `]`, `)` or `>`) with no newline after it, followed by a pause. squelch clears the live view and shows the prompt as-is. A prompt on stderr also brings along any stderr you haven't seen yet, since the question is probably about it. Once you answer and the command writes again, the live view comes back.
+squelch leaves stdout alone. The command writes it to a pty, so it sees a terminal just as it would without squelch, and squelch passes the bytes on unchanged. Colors, prompts, and full-screen programs work as usual. The live view stays out of the way of the command's output: squelch draws it only when the command has finished its current line of stdout, and never while the command is on the alternate screen, as full-screen programs are. The tail includes the stderr line the command is partway through, so a prompt on stderr shows up while it waits for an answer.
 
-The command gets squelch's stdin. If stdout is piped or redirected, squelch draws on stderr instead and the command's output passes through untouched. If neither is a terminal, squelch skips the live view and just holds stderr back until it knows whether the command failed.
+The command gets squelch's stdin. If stdout is piped or redirected, squelch draws on stderr instead and the command writes straight to squelch's stdout. If neither is a terminal, squelch skips the live view and just holds stderr back until it knows whether the command failed.
 
 # Demo
 
@@ -48,10 +48,6 @@ This wraps `gcloud` in a function that runs `squelch run gcloud`, and tab comple
 NOSQUELCH=1 gcloud compute instances list
 ```
 
-Some commands can't run under squelch at all, such as a full-screen terminal UI, which needs the terminal as its stdout. To skip squelch whenever a wrapped command gets a particular argument, add `--skip-arg`. It's repeatable, applies to every `--cmd`, and matches whole arguments only, so `--tui=true` doesn't count:
-
-```sh
-eval "$(squelch init zsh --cmd ct --skip-arg --tui)"
-``` `init` includes squelch's own completion, so don't also load `squelch completion zsh`, which would take back completion for `squelch` and turn off the passthrough.
+`init` includes squelch's own completion, so don't also load `squelch completion zsh`, which would take back completion for `squelch` and turn off the passthrough.
 
 Only zsh is supported for now.

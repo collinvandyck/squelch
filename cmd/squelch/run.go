@@ -7,13 +7,17 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
-	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/term"
+	"github.com/creack/pty"
 	"github.com/spf13/cobra"
 )
+
+// drainTimeout is how long to keep reading the command's output after it exits.
+const drainTimeout = 250 * time.Millisecond
 
 func newRunCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -30,40 +34,149 @@ func newRunCmd() *cobra.Command {
 }
 
 func run(args []string) error {
-	opts := []tea.ProgramOption{
-		// The command gets our stdin, so Bubbletea must not read it. Without input, Bubbletea also skips its terminal
-		// queries, whose replies would otherwise leak into the shell after we exit (bubbletea#1590).
-		tea.WithInput(nil),
-		// Without raw mode, Ctrl+C is a real SIGINT, and Bubbletea would quit on it before the command exits.
-		tea.WithoutSignalHandler(),
-	}
-	var directStdout io.Writer
 	switch {
 	case term.IsTerminal(os.Stdout.Fd()):
+		return runWithView(args, os.Stdout)
 	case term.IsTerminal(os.Stderr.Fd()):
-		// Drawing on stdout would put frames and terminal queries in the command's output, so draw on stderr and give
-		// the command our stdout directly.
-		opts = append(opts, tea.WithOutput(os.Stderr))
-		directStdout = os.Stdout
+		return runWithView(args, os.Stderr)
 	default:
 		return runPlain(args)
 	}
-	c, err := startCommand(args, directStdout)
+}
+
+// runWithView runs the command with the live view drawn on tty. When tty is our stdout, the command's stdout goes
+// through a pty, so that the command sees a terminal, and we pass its bytes on untouched. Otherwise the command gets our
+// stdout directly.
+func runWithView(args []string, tty *os.File) error {
+	width, _, _ := term.GetSize(tty.Fd())
+	s := newScreen(tty, width)
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	var ptmx, ptySlave *os.File
+	if tty == os.Stdout {
+		var err error
+		if ptmx, ptySlave, err = openPty(tty); err != nil {
+			return err
+		}
+		defer ptmx.Close()
+		cmd.Stdout = ptySlave
+	}
+	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
 		return err
 	}
-	defer c.cancel()
-	// Forward signals here rather than through Bubbletea, whose event loop blocks while a prompt waits for an answer.
-	stop := catchSignals(func(sig os.Signal) { _ = c.cmd.Process.Signal(sig) })
-	defer stop()
-	m := newModel(c)
-	m.stdinIsTerminal = term.IsTerminal(os.Stdin.Fd())
-	ret, err := tea.NewProgram(m, opts...).Run()
+	defer stderrR.Close()
+	cmd.Stderr = stderrW
+	err = cmd.Start()
+	// The command has its own copies now. Ours would keep the readers from seeing EOF once it exits.
+	_ = stderrW.Close()
+	if ptySlave != nil {
+		_ = ptySlave.Close()
+	}
 	if err != nil {
 		return err
 	}
-	m = ret.(model)
-	return finish(m.err, m.stderr[m.stderrShown:])
+	var readers sync.WaitGroup
+	readers.Go(func() { copyTo(s.writeStderr, stderrR) })
+	if ptmx != nil {
+		readers.Go(func() { copyTo(s.writeStdout, ptmx) })
+	}
+	stopSignals := catchSignals(func(sig os.Signal) { _ = cmd.Process.Signal(sig) })
+	defer stopSignals()
+	stopResize := followResize(tty, ptmx, s)
+	defer stopResize()
+	cmdErr := cmd.Wait()
+	// What the command wrote before it exited is waiting to be read, but something it left running in the background can
+	// hold the pty or pipe open indefinitely, so don't wait long for EOF.
+	deadline := time.Now().Add(drainTimeout)
+	_ = stderrR.SetReadDeadline(deadline)
+	if ptmx != nil {
+		_ = ptmx.SetReadDeadline(deadline)
+	}
+	readers.Wait()
+	if !s.close() && cmdErr != nil {
+		// Start the stderr dump on a line of its own.
+		_, _ = tty.WriteString("\r\n")
+	}
+	return finish(cmdErr, s.stderr)
+}
+
+// openPty opens a pty the size of tty for the command's stdout. Its output processing is off, so the command's bytes
+// reach the terminal exactly as written.
+func openPty(tty *os.File) (ptmx, slave *os.File, err error) {
+	m, slave, err := pty.Open()
+	if err != nil {
+		return nil, nil, err
+	}
+	ptmx, err = pollable(m)
+	if err == nil {
+		err = pty.InheritSize(tty, ptmx)
+	}
+	if err == nil {
+		_, err = term.MakeRaw(slave.Fd())
+	}
+	if err != nil {
+		if ptmx != nil {
+			_ = ptmx.Close()
+		}
+		_ = slave.Close()
+		return nil, nil, err
+	}
+	return ptmx, slave, nil
+}
+
+// pollable returns a copy of f that supports read deadlines, and closes f. An os.File supports deadlines only if its
+// descriptor was non-blocking when it was wrapped, which pty.Open's isn't.
+func pollable(f *os.File) (*os.File, error) {
+	syscall.ForkLock.RLock()
+	fd, err := syscall.Dup(int(f.Fd()))
+	if err == nil {
+		syscall.CloseOnExec(fd)
+	}
+	syscall.ForkLock.RUnlock()
+	_ = f.Close()
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.SetNonblock(fd, true); err != nil {
+		_ = syscall.Close(fd)
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), f.Name()), nil
+}
+
+// followResize keeps the view's width, and the pty's size when there is one, in step with tty.
+func followResize(tty, ptmx *os.File, s *screen) (stop func()) {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGWINCH)
+	go func() {
+		for range sigs {
+			if ptmx != nil {
+				_ = pty.InheritSize(tty, ptmx)
+			}
+			if width, _, err := term.GetSize(tty.Fd()); err == nil {
+				s.resize(width)
+			}
+		}
+	}()
+	return func() {
+		signal.Stop(sigs)
+		close(sigs)
+	}
+}
+
+func copyTo(write func([]byte), r io.Reader) {
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			write(buf[:n])
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 // runPlain passes stdin and stdout straight through and holds stderr back until we know whether the command failed.

@@ -20,17 +20,18 @@ func (b *lineBuffer) write(p []byte) []string {
 		if i < 0 {
 			break
 		}
-		line := strings.TrimSuffix(string(b.partial[:i]), "\r")
-		if j := strings.LastIndexByte(line, '\r'); j >= 0 {
-			line = line[j+1:]
-		}
-		lines = append(lines, line)
+		lines = append(lines, visible(string(b.partial[:i])))
 		b.partial = b.partial[i+1:]
 	}
 	if len(b.partial) == 0 {
 		b.partial = nil
 	}
 	return lines
+}
+
+// current returns what the unterminated last line would show on a terminal so far.
+func (b *lineBuffer) current() string {
+	return visible(string(b.partial))
 }
 
 // flush returns the unterminated last line, if there is one, and empties the buffer.
@@ -41,4 +42,13 @@ func (b *lineBuffer) flush() (string, bool) {
 	line := string(b.partial)
 	b.partial = nil
 	return line, true
+}
+
+// visible returns what follows the last carriage return in line, ignoring one at the very end, as with \r\n endings.
+func visible(line string) string {
+	line = strings.TrimSuffix(line, "\r")
+	if i := strings.LastIndexByte(line, '\r'); i >= 0 {
+		line = line[i+1:]
+	}
+	return line
 }

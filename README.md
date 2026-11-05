@@ -8,7 +8,7 @@ When the command exits, the live view disappears. If the command succeeded, its 
 
 squelch leaves stdout alone. The command writes it to a pty, so it sees a terminal just as it would without squelch, and squelch passes the bytes on unchanged. Colors, prompts, and full-screen programs work as usual. The live view stays out of the way of the command's output: squelch draws it only when the command has finished its current line of stdout, and never while the command is on the alternate screen, as full-screen programs are. The tail includes the stderr line the command is partway through, so a prompt on stderr shows up while it waits for an answer.
 
-The command gets squelch's stdin. If stdout is piped or redirected, squelch draws on stderr instead and the command writes straight to squelch's stdout. If neither is a terminal, squelch skips the live view and just holds stderr back until it knows whether the command failed.
+The command gets squelch's stdin. If stdout is piped or redirected, squelch skips the live view, writes the command's stdout straight to the pipe or file, and holds stderr back until it knows whether the command failed. Whatever reads a pipe, such as `jq` or `less`, may be writing to the same terminal, and its output would land on top of the view.
 
 # Demo
 

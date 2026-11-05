@@ -33,37 +33,32 @@ func newRunCmd() *cobra.Command {
 	return cmd
 }
 
+// run draws the live view only when stdout is a terminal. When it's a pipe, whatever reads it, such as jq or less, may
+// write to the same terminal, and we can't see when it does, so its output would land on top of the view.
 func run(args []string) error {
-	switch {
-	case term.IsTerminal(os.Stdout.Fd()):
-		return runWithView(args, os.Stdout)
-	case term.IsTerminal(os.Stderr.Fd()):
-		return runWithView(args, os.Stderr)
-	default:
-		return runPlain(args)
+	if term.IsTerminal(os.Stdout.Fd()) {
+		return runWithView(args)
 	}
+	return runPlain(args)
 }
 
-// runWithView runs the command with the live view drawn on tty. When tty is our stdout, the command's stdout goes
-// through a pty, so that the command sees a terminal, and we pass its bytes on untouched. Otherwise the command gets our
-// stdout directly.
-func runWithView(args []string, tty *os.File) error {
+// runWithView runs the command with the live view drawn on our stdout. The command's stdout goes through a pty, so
+// that the command sees a terminal, and we pass its bytes on untouched.
+func runWithView(args []string) error {
+	tty := os.Stdout
 	width, _, _ := term.GetSize(tty.Fd())
 	s := newScreen(tty, width)
+	ptmx, ptySlave, err := openPty(tty)
+	if err != nil {
+		return err
+	}
+	defer ptmx.Close()
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	var ptmx, ptySlave *os.File
-	if tty == os.Stdout {
-		var err error
-		if ptmx, ptySlave, err = openPty(tty); err != nil {
-			return err
-		}
-		defer ptmx.Close()
-		cmd.Stdout = ptySlave
-	}
+	cmd.Stdout = ptySlave
 	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
+		_ = ptySlave.Close()
 		return err
 	}
 	defer stderrR.Close()
@@ -71,17 +66,13 @@ func runWithView(args []string, tty *os.File) error {
 	err = cmd.Start()
 	// The command has its own copies now. Ours would keep the readers from seeing EOF once it exits.
 	_ = stderrW.Close()
-	if ptySlave != nil {
-		_ = ptySlave.Close()
-	}
+	_ = ptySlave.Close()
 	if err != nil {
 		return err
 	}
 	var readers sync.WaitGroup
 	readers.Go(func() { copyTo(s.writeStderr, stderrR) })
-	if ptmx != nil {
-		readers.Go(func() { copyTo(s.writeStdout, ptmx) })
-	}
+	readers.Go(func() { copyTo(s.writeStdout, ptmx) })
 	stopSignals := catchSignals(func(sig os.Signal) { _ = cmd.Process.Signal(sig) })
 	defer stopSignals()
 	stopResize := followResize(tty, ptmx, s)
@@ -91,9 +82,7 @@ func runWithView(args []string, tty *os.File) error {
 	// hold the pty or pipe open indefinitely, so don't wait long for EOF.
 	deadline := time.Now().Add(drainTimeout)
 	_ = stderrR.SetReadDeadline(deadline)
-	if ptmx != nil {
-		_ = ptmx.SetReadDeadline(deadline)
-	}
+	_ = ptmx.SetReadDeadline(deadline)
 	readers.Wait()
 	if !s.close() && cmdErr != nil {
 		// Start the stderr dump on a line of its own.
@@ -146,15 +135,13 @@ func pollable(f *os.File) (*os.File, error) {
 	return os.NewFile(uintptr(fd), f.Name()), nil
 }
 
-// followResize keeps the view's width, and the pty's size when there is one, in step with tty.
+// followResize keeps the pty's size and the view's width in step with tty.
 func followResize(tty, ptmx *os.File, s *screen) (stop func()) {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGWINCH)
 	go func() {
 		for range sigs {
-			if ptmx != nil {
-				_ = pty.InheritSize(tty, ptmx)
-			}
+			_ = pty.InheritSize(tty, ptmx)
 			if width, _, err := term.GetSize(tty.Fd()); err == nil {
 				s.resize(width)
 			}

@@ -64,6 +64,18 @@ func TestRunGivesStdoutATerminal(t *testing.T) {
 	term.waitFor(t, "stdout is a terminal")
 }
 
+// TestRunSkipsViewWhenStdoutIsPiped checks that no live view is drawn when stdout goes to a pipe, since whatever reads
+// it may write to the same terminal, where it would land on top of the view.
+func TestRunSkipsViewWhenStdoutIsPiped(t *testing.T) {
+	script := `echo "some warning" >&2; sleep 0.3; echo result`
+	term := startCmdInPty(t, "sh", "-c", squelchBin+` run sh -c '`+script+`' | cat`)
+	term.wait(t)
+	term.waitFor(t, "result")
+	if strings.Contains(term.text(), "some warning") {
+		t.Errorf("view drawn while stdout was piped:\n%q", term.raw())
+	}
+}
+
 // TestRunKeepsViewOffUnfinishedLine checks that the live view doesn't draw over a line of stdout the command hasn't
 // finished, such as a prompt waiting for an answer.
 func TestRunKeepsViewOffUnfinishedLine(t *testing.T) {
@@ -169,7 +181,13 @@ type ptyTerm struct {
 // startInPty runs script under squelch with a pty for stdin, stdout, and stderr.
 func startInPty(t *testing.T, script string) *ptyTerm {
 	t.Helper()
-	cmd := exec.CommandContext(t.Context(), squelchBin, "run", "sh", "-c", script)
+	return startCmdInPty(t, squelchBin, "run", "sh", "-c", script)
+}
+
+// startCmdInPty runs a command with a pty for stdin, stdout, and stderr.
+func startCmdInPty(t *testing.T, name string, args ...string) *ptyTerm {
+	t.Helper()
+	cmd := exec.CommandContext(t.Context(), name, args...)
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 24, Cols: 100})
 	if err != nil {
 		t.Fatal(err)
